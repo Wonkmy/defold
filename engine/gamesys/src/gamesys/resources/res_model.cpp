@@ -97,8 +97,14 @@ namespace dmGameSystem
         std::sort(resource->m_Meshes.Begin(), resource->m_Meshes.End(), MeshSortPred());
     }
 
+    enum RigModelVertexFormat
+    {
+        RIG_MODEL_VERTEX_FORMAT_STATIC,
+        RIG_MODEL_VERTEX_FORMAT_SKINNED
+    };
+
     // TODO: Now that we don't split meshes at runtime, we should move this code to the build pipeline /MAWE
-    static dmRig::RigModelVertex* CreateVertexData(const dmRigDDF::Mesh* mesh, dmRig::RigModelVertex* out_write_ptr)
+    static dmRig::RigModelVertex* CreateVertexData(const dmRigDDF::Mesh* mesh, uint8_t* out_write_ptr, RigModelVertexFormat format)
     {
         uint32_t vertex_count = mesh->m_Positions.m_Count / 3;
 
@@ -108,6 +114,11 @@ namespace dmGameSystem
         const float* colors = mesh->m_Colors.m_Count ? mesh->m_Colors.m_Data : 0;
         const float* uv0 = mesh->m_Texcoord0.m_Count ? mesh->m_Texcoord0.m_Data : 0;
         const float* uv1 = mesh->m_Texcoord1.m_Count ? mesh->m_Texcoord1.m_Data : 0;
+        const float* weights = mesh->m_Weights.m_Count ? mesh->m_Weights.m_Data : 0;
+        const uint32_t* indices = mesh->m_BoneIndices.m_Count ? mesh->m_BoneIndices.m_Data : 0;
+
+        dmRig::RigModelVertex* static_mesh = (dmRig::RigModelVertex*) out_write_ptr;
+        dmRig::RigModelSkinnedVertex* skinned_mesh = (dmRig::RigModelSkinnedVertex*) out_write_ptr;
 
         for (uint32_t i = 0; i < vertex_count; ++i)
         {
@@ -129,13 +140,26 @@ namespace dmGameSystem
                 out_write_ptr->uv1[c] = uv1 ? *uv1++ : 0.0f;
             }
 
+            if (includeSkin)
+            {
+                for (int c = 0; c < 4; ++c)
+                {
+                    skin_write_ptr->m_Weights[c] = weights ? *weights++ : 0.0f;
+                }
+
+                for (int c = 0; c < 4; ++c)
+                {
+                    skin_write_ptr->m_Indices[c] = indices ? (float) *indices++ : 0.0f;
+                }
+            }
+
             out_write_ptr++;
         }
 
         return out_write_ptr;
     }
 
-    static ModelResourceBuffers* CreateBuffers(dmGraphics::HContext context, const dmRigDDF::Mesh* ddf_mesh, dmArray<dmRig::RigModelVertex>& scratch_buffer)
+    static ModelResourceBuffers* CreateBuffers(dmGraphics::HContext context, const ModelResource* resource, const dmRigDDF::Mesh* ddf_mesh, dmArray<dmRig::RigModelVertex>& scratch_buffer)
     {
         ModelResourceBuffers* buffers = new ModelResourceBuffers;
         memset(buffers, 0, sizeof(ModelResourceBuffers));
@@ -188,7 +212,7 @@ namespace dmGameSystem
         for (uint32_t i = 0; i < resource->m_Meshes.Size(); ++i)
         {
             MeshInfo& info = resource->m_Meshes[i];
-            info.m_Buffers = CreateBuffers(context, info.m_Mesh, scratch_buffer);
+            info.m_Buffers = CreateBuffers(context, resource, info.m_Mesh, scratch_buffer);
         }
     }
 
@@ -316,6 +340,7 @@ namespace dmGameSystem
             return result;
         }
 
+        /*
         if(resource->m_RigScene->m_AnimationSetRes || resource->m_RigScene->m_SkeletonRes)
         {
             if (!AreAllMaterialsWorldSpace(resource))
@@ -324,6 +349,7 @@ namespace dmGameSystem
                 return dmResource::RESULT_NOT_SUPPORTED;
             }
         }
+        */
 
         return result;
     }
