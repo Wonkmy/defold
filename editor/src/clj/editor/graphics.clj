@@ -13,7 +13,8 @@
 ;; specific language governing permissions and limitations under the License.
 
 (ns editor.graphics
-  (:require [dynamo.graph :as g]
+  (:require [editor.buffers :as buffers]
+            [dynamo.graph :as g]
             [editor.geom :as geom]
             [editor.gl.shader :as shader]
             [editor.gl.vertex2 :as vtx]
@@ -163,12 +164,38 @@
 ;; transformed correctly by a 4D matrix. For colors, we default to opaque white.
 (def ^:private default-attribute-element-values (vector-of :double 0.0 0.0 0.0 0.0))
 (def ^:private default-attribute-element-values-mat4 (vector-of :double
-                                                                1.0 0.0 0.0 0.0
-                                                                0.0 1.0 0.0 0.0
-                                                                0.0 0.0 1.0 0.0
-                                                                0.0 0.0 0.0 1.0))
+                                                                0.0 0.0 0.0 0.0
+                                                                0.0 0.0 0.0 0.0
+                                                                0.0 0.0 0.0 0.0
+                                                                0.0 0.0 0.0 0.0))
+;; Transform values (i.e identity world, normal matrices)
+(def ^:private default-attribute-transform-values-mat4 (vector-of :double
+                                                                  1.0 0.0 0.0 0.0
+                                                                  0.0 1.0 0.0 0.0
+                                                                  0.0 0.0 1.0 0.0
+                                                                  0.0 0.0 0.0 1.0))
+
+;; Position semantic values
 (def ^:private default-position-element-values (vector-of :double 0.0 0.0 0.0 1.0))
+(def ^:private default-position-element-values-mat4 (vector-of :double
+                                                               0.0 0.0 0.0 1.0
+                                                               0.0 0.0 0.0 1.0
+                                                               0.0 0.0 0.0 1.0
+                                                               0.0 0.0 0.0 1.0))
+;; Color semantic values
 (def ^:private default-color-element-values (vector-of :double 1.0 1.0 1.0 1.0))
+(def ^:private default-color-element-values-mat4 (vector-of :double
+                                                            1.0 1.0 1.0 1.0
+                                                            1.0 1.0 1.0 1.0
+                                                            1.0 1.0 1.0 1.0
+                                                            1.0 1.0 1.0 1.0))
+
+(defn- vector-type-is-matrix? [attribute-vector-type]
+  (case attribute-vector-type
+    :vector-type-mat2 true
+    :vector-type-mat3 true
+    :vector-type-mat4 true
+    false))
 
 (defn vector-type->component-count [attribute-vector-type]
   (case attribute-vector-type
@@ -179,6 +206,16 @@
     :vector-type-mat2 4
     :vector-type-mat3 9
     :vector-type-mat4 16))
+
+(defn- shader-uniform-type->vector-type [shader-uniform-type]
+  (case shader-uniform-type
+    :float :vector-type-scalar
+    :float-vec2 :vector-type-vec2
+    :float-vec3 :vector-type-vec3
+    :float-vec4 :vector-type-vec4
+    :float-mat2 :vector-type-mat2
+    :float-mat3 :vector-type-mat3
+    :float-mat4 :vector-type-mat4))
 
 (defn resize-doubles [double-values semantic-type new-vector-type]
   {:pre [(vector? double-values)
@@ -192,12 +229,18 @@
 
       (> new-element-count old-element-count)
       (let [default-element-values
-            (case semantic-type
-              :semantic-type-position default-position-element-values
-              :semantic-type-color default-color-element-values
-              :semantic-type-world-matrix default-attribute-element-values-mat4
-              :semantic-type-normal-matrix default-attribute-element-values-mat4
-              default-attribute-element-values)]
+            (if (vector-type-is-matrix? new-vector-type)
+              (case semantic-type
+                :semantic-type-position default-position-element-values-mat4
+                :semantic-type-color default-color-element-values-mat4
+                :semantic-type-world-matrix default-attribute-transform-values-mat4
+                :semantic-type-normal-matrix default-attribute-transform-values-mat4
+                default-attribute-element-values-mat4)
+
+              (case semantic-type
+                :semantic-type-position default-position-element-values
+                :semantic-type-color default-color-element-values
+                default-attribute-element-values))]
         (into double-values
               (subvec default-element-values old-element-count new-element-count)))
 
@@ -414,9 +457,18 @@
             :step-function :vertex-step-function-instance
             :vector-type :vector-type-mat4}])))
 
+
+(defn- compatible-vector-type [vector-type-value vector-type-container]
+  (let [vector-type-value-comp-count (vector-type->component-count vector-type-value)
+        vector-type-container-comp-count (vector-type->component-count vector-type-container)]
+    (if (<= vector-type-value-comp-count vector-type-container-comp-count)
+      vector-type-value
+      vector-type-container)))
+
 (defn shader-bound-attributes [^GL2 gl shader material-attribute-infos manufactured-attribute-keys default-coordinate-space]
   {:pre [(coordinate-space? default-coordinate-space)]}
-  (let [shader-bound-attribute? (comp boolean (shader/attribute-infos shader gl) :name)
+  (let [shader-attribute-infos (shader/attribute-infos shader gl)
+        shader-bound-attribute? (comp boolean shader-attribute-infos :name)
         declared-material-attribute-key? (into #{} (map :name-key) material-attribute-infos)
 
         manufactured-attribute-infos
@@ -427,11 +479,18 @@
                  (cond-> attribute-info
                          (= :default (:coordinate-space attribute-info))
                          (assoc :coordinate-space default-coordinate-space))))
-          manufactured-attribute-keys)]
+          manufactured-attribute-keys)
 
-    (filterv shader-bound-attribute?
-             (concat manufactured-attribute-infos
-                     material-attribute-infos))))
+        ensure-correct-vector-type-fn (fn [attribute-info]
+                                        (let [shader-attribute-info (get shader-attribute-infos (:name attribute-info))
+                                              shader-attribute-vector-type (shader-uniform-type->vector-type (:type shader-attribute-info))
+                                              compatible-vector-type (compatible-vector-type (:vector-type attribute-info) shader-attribute-vector-type)]
+                                          (assoc attribute-info :vector-type compatible-vector-type)))
+
+        filtered-attribute-infos (filterv shader-bound-attribute?
+                                          (concat manufactured-attribute-infos
+                                                  material-attribute-infos))]
+    (mapv ensure-correct-vector-type-fn filtered-attribute-infos)))
 
 (defn vertex-attribute-overrides->save-values [vertex-attribute-overrides material-attribute-infos]
   (let [declared-material-attribute-key? (into #{} (map :name-key) material-attribute-infos)
@@ -653,25 +712,14 @@
 (def ^:private renderable-data->world-normal-v4 (partial renderable-data->world-direction-v4 :normal-data))
 (def ^:private renderable-data->world-tangent-v3 (partial renderable-data->world-direction-v3 :tangent-data))
 
-(defn- matrix4+attribute->bytes [^Matrix4d matrix attribute]
+(defn- matrix4+attribute->flat-array [^Matrix4d matrix attribute]
   (let [vector-component-count (vector-type->component-count (:vector-type attribute))
         matrix-flat-array (math/vecmath->clj (doto (Matrix4d. matrix) (.transpose)))
-        matrix-4x4-array (partition 4 matrix-flat-array)
-        matrix-row-column-count (vtx/vertex-attribute->row-column-count attribute)
-        ;; Grab the flat list of float values from either the first n values of the array,
-        ;; or an n-by-n sub-matrix that should match the outgoing vector type
-        flat-vector-values (if (nil? matrix-row-column-count)
-                             (take vector-component-count matrix-flat-array)
-                             (vec (flatten
-                                    (map #(take matrix-row-column-count %)
-                                         (take matrix-row-column-count matrix-4x4-array)))))
-        num-floats (if (nil? matrix-row-column-count)
-                     vector-component-count
-                     (* matrix-row-column-count matrix-row-column-count))
-        byte-array (byte-array (* 4 num-floats))
-        byte-buffer (vtx/wrap-buf byte-array)]
-    (vtx/buf-push! byte-buffer :float false flat-vector-values)
-    byte-array))
+        matrix-row-column-count (vtx/vertex-attribute->row-column-count attribute)]
+    (vec (flatten (if matrix-row-column-count
+                    (map #(take matrix-row-column-count %)
+                         (take matrix-row-column-count (partition 4 matrix-flat-array)))
+                    (take vector-component-count matrix-flat-array))))))
 
 (defn put-attributes! [^VertexBuffer vbuf renderable-datas]
   (let [vertex-description (.vertex-description vbuf)
@@ -734,12 +782,10 @@
                      (some? (:tangent-data renderable-data)))
 
                 :semantic-type-world-matrix
-                (and (zero? channel)
-                     (some? (:has-semantic-type-world-matrix renderable-data)))
+                (some? (:has-semantic-type-world-matrix renderable-data))
 
                 :semantic-type-normal-matrix
-                (and (zero? channel)
-                     (some? (:has-semantic-type-normal-matrix renderable-data)))
+                (some? (:has-semantic-type-normal-matrix renderable-data))
 
                 false))))]
 
@@ -823,25 +869,31 @@
                     (put-renderables! attribute-byte-offset
                                       (fn [renderable-data]
                                         (let [vertex-count (count (:position-data renderable-data))
-                                              matrix-bytes (matrix4+attribute->bytes (:world-transform renderable-data) attribute)]
-                                          (repeat vertex-count matrix-bytes)))
-                                      put-attribute-bytes!)
+                                              matrix-values (matrix4+attribute->flat-array (:world-transform renderable-data) attribute)]
+                                          (repeat vertex-count matrix-values)))
+                                      put-attribute-doubles!)
 
                     :semantic-type-normal-matrix
                     (put-renderables! attribute-byte-offset
                                       (fn [renderable-data]
                                         (let [vertex-count (count (:position-data renderable-data))
-                                              matrix-bytes (matrix4+attribute->bytes (:normal-transform renderable-data) attribute)]
-                                          (repeat vertex-count matrix-bytes)))
-                                      put-attribute-bytes!))
+                                              matrix-values (matrix4+attribute->flat-array (:normal-transform renderable-data) attribute)]
+                                          (repeat vertex-count matrix-values)))
+                                      put-attribute-doubles!))
 
                   ;; Mesh data doesn't exist. Use the attribute data from the
                   ;; material or overrides.
                   (put-renderables! attribute-byte-offset
                                     (fn [renderable-data]
                                       (let [vertex-count (count (:position-data renderable-data))
-                                            attribute-bytes (get (:vertex-attribute-bytes renderable-data) name-key)]
-                                        (repeat vertex-count attribute-bytes)))
+                                            attribute-bytes (get (:vertex-attribute-bytes renderable-data) name-key)
+                                            attribute-byte-count-max (* element-count (buffers/type-size buffer-data-type))]
+                                        ;; Clamp the buffer if the container format is smaller than specified in the material
+                                        (if (> (count attribute-bytes) attribute-byte-count-max)
+                                          (let [attribute-bytes-clamped (byte-array attribute-byte-count-max)]
+                                            (System/arraycopy attribute-bytes 0 attribute-bytes-clamped 0 attribute-byte-count-max)
+                                            (repeat vertex-count attribute-bytes-clamped))
+                                          (repeat vertex-count attribute-bytes))))
                                     put-attribute-bytes!))
                 (-> reduce-info
                     (update semantic-type inc)
