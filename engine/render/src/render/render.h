@@ -41,6 +41,8 @@ namespace dmRender
     static const dmhash_t VERTEX_STREAM_PAGE_INDEX    = dmHashString64("page_index");
     static const dmhash_t VERTEX_STREAM_WORLD_MATRIX  = dmHashString64("mtx_world");
     static const dmhash_t VERTEX_STREAM_NORMAL_MATRIX = dmHashString64("mtx_normal");
+    static const dmhash_t VERTEX_STREAM_BONE_WEIGHTS  = dmHashString64("bone_weights");
+    static const dmhash_t VERTEX_STREAM_BONE_INDICES  = dmHashString64("bone_indices");
 
     typedef struct RenderTargetSetup*       HRenderTargetSetup;
     typedef uint64_t                        HRenderType;
@@ -274,6 +276,7 @@ namespace dmRender
     void                            GetMaterialProgramAttributes(HMaterial material, const dmGraphics::VertexAttribute** attributes, uint32_t* attribute_count);
     void                            GetMaterialProgramAttributeValues(HMaterial material, uint32_t index, const uint8_t** value_ptr, uint32_t* num_values);
     void                            SetMaterialProgramAttributes(HMaterial material, const dmGraphics::VertexAttribute* attributes, uint32_t attributes_count);
+    bool                            GetMaterialHasSkinnedAttributes(HMaterial material);
 
     // Compute
     HComputeProgram                 NewComputeProgram(HRenderContext render_context, dmGraphics::HComputeProgram shader);

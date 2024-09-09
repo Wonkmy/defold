@@ -97,16 +97,33 @@ namespace dmGameSystem
         std::sort(resource->m_Meshes.Begin(), resource->m_Meshes.End(), MeshSortPred());
     }
 
-    enum RigModelVertexFormat
+    static inline uint32_t GetRigModelVertexFormatSize(RigModelVertexFormat format)
     {
-        RIG_MODEL_VERTEX_FORMAT_STATIC,
-        RIG_MODEL_VERTEX_FORMAT_SKINNED
-    };
+        switch (format)
+        {
+        case RIG_MODEL_VERTEX_FORMAT_STATIC:
+            return sizeof(dmRig::RigModelVertex);
+        case RIG_MODEL_VERTEX_FORMAT_SKINNED:
+            return sizeof(dmRig::RigModelSkinnedVertex);
+        }
+        return 0;
+    }
+
+    static inline RigModelVertexFormat GetRigModelVertexFormat(const dmRigDDF::Mesh* mesh)
+    {
+        const float* weights = mesh->m_Weights.m_Count ? mesh->m_Weights.m_Data : 0;
+        const uint32_t* indices = mesh->m_BoneIndices.m_Count ? mesh->m_BoneIndices.m_Data : 0;
+        if (weights && indices)
+            return RIG_MODEL_VERTEX_FORMAT_SKINNED;
+        return RIG_MODEL_VERTEX_FORMAT_STATIC;
+    }
 
     // TODO: Now that we don't split meshes at runtime, we should move this code to the build pipeline /MAWE
-    static dmRig::RigModelVertex* CreateVertexData(const dmRigDDF::Mesh* mesh, uint8_t* out_write_ptr, RigModelVertexFormat format)
+    static uint8_t* CreateVertexData(const dmRigDDF::Mesh* mesh, uint8_t* out_write_ptr, RigModelVertexFormat format)
     {
         uint32_t vertex_count = mesh->m_Positions.m_Count / 3;
+
+        uint8_t* out_write_ptr_orig = out_write_ptr;
 
         const float* positions = mesh->m_Positions.m_Count ? mesh->m_Positions.m_Data : 0;
         const float* normals = mesh->m_Normals.m_Count ? mesh->m_Normals.m_Data : 0;
@@ -117,49 +134,66 @@ namespace dmGameSystem
         const float* weights = mesh->m_Weights.m_Count ? mesh->m_Weights.m_Data : 0;
         const uint32_t* indices = mesh->m_BoneIndices.m_Count ? mesh->m_BoneIndices.m_Data : 0;
 
-        dmRig::RigModelVertex* static_mesh = (dmRig::RigModelVertex*) out_write_ptr;
-        dmRig::RigModelSkinnedVertex* skinned_mesh = (dmRig::RigModelSkinnedVertex*) out_write_ptr;
+        uint32_t vertex_size = GetRigModelVertexFormatSize(format);
 
         for (uint32_t i = 0; i < vertex_count; ++i)
         {
+            dmRig::RigModelVertex* vertex = (dmRig::RigModelVertex*) out_write_ptr;
+
             for (int c = 0; c < 3; ++c)
             {
-                out_write_ptr->pos[c] = *positions++;
-                out_write_ptr->normal[c] = normals ? *normals++ : 0.0f;
+                vertex->pos[c] = *positions++;
+                vertex->normal[c] = normals ? *normals++ : 0.0f;
             }
 
             for (int c = 0; c < 4; ++c)
             {
-                out_write_ptr->color[c] = colors ? *colors++ : 1.0f;
-                out_write_ptr->tangent[c] = tangents ? *tangents++ : 0.0f;
+                vertex->color[c] = colors ? *colors++ : 1.0f;
+                vertex->tangent[c] = tangents ? *tangents++ : 0.0f;
             }
 
             for (int c = 0; c < 2; ++c)
             {
-                out_write_ptr->uv0[c] = uv0 ? *uv0++ : 0.0f;
-                out_write_ptr->uv1[c] = uv1 ? *uv1++ : 0.0f;
+                vertex->uv0[c] = uv0 ? *uv0++ : 0.0f;
+                vertex->uv1[c] = uv1 ? *uv1++ : 0.0f;
             }
 
-            if (includeSkin)
+            if (format == RIG_MODEL_VERTEX_FORMAT_SKINNED)
             {
+                dmRig::RigModelSkinnedVertex* vertex_skinned = (dmRig::RigModelSkinnedVertex*) out_write_ptr;
                 for (int c = 0; c < 4; ++c)
                 {
-                    skin_write_ptr->m_Weights[c] = weights ? *weights++ : 0.0f;
+                    vertex_skinned->m_BoneWeights[c] = weights ? *weights++ : 0.0f;
                 }
 
                 for (int c = 0; c < 4; ++c)
                 {
-                    skin_write_ptr->m_Indices[c] = indices ? (float) *indices++ : 0.0f;
+                    vertex_skinned->m_BoneIndices[c] = indices ? (float) *indices++ : 0.0f;
                 }
             }
 
-            out_write_ptr++;
+            out_write_ptr += vertex_size;
         }
+
+        /*
+        if (format == RIG_MODEL_VERTEX_FORMAT_SKINNED)
+        {
+            for (int i = 0; i < vertex_count; ++i)
+            {
+                dmRig::RigModelSkinnedVertex* vx = (dmRig::RigModelSkinnedVertex*) out_write_ptr_orig;
+
+                dmLogInfo("weights: %f, %f, %f, %f", vx->m_BoneWeights[0], vx->m_BoneWeights[1], vx->m_BoneWeights[2], vx->m_BoneWeights[3]);
+                dmLogInfo("indices: %f, %f, %f, %f", vx->m_BoneIndices[0], vx->m_BoneIndices[1], vx->m_BoneIndices[2], vx->m_BoneIndices[3]);
+
+                out_write_ptr_orig += vertex_size;
+            }
+        }
+        */
 
         return out_write_ptr;
     }
 
-    static ModelResourceBuffers* CreateBuffers(dmGraphics::HContext context, const ModelResource* resource, const dmRigDDF::Mesh* ddf_mesh, dmArray<dmRig::RigModelVertex>& scratch_buffer)
+    static ModelResourceBuffers* CreateBuffers(dmGraphics::HContext context, const ModelResource* resource, const dmRigDDF::Mesh* ddf_mesh, dmArray<uint8_t>& scratch_buffer)
     {
         ModelResourceBuffers* buffers = new ModelResourceBuffers;
         memset(buffers, 0, sizeof(ModelResourceBuffers));
@@ -184,14 +218,19 @@ namespace dmGameSystem
             }
         }
 
-        if (scratch_buffer.Capacity() < num_vertices)
-            scratch_buffer.SetCapacity(num_vertices);
-        scratch_buffer.SetSize(num_vertices);
+        RigModelVertexFormat format = GetRigModelVertexFormat(ddf_mesh);
+        uint32_t vertex_size = GetRigModelVertexFormatSize(format);
+        uint32_t data_size = num_vertices * vertex_size;
 
-        CreateVertexData(ddf_mesh, scratch_buffer.Begin());
+        if (scratch_buffer.Capacity() < data_size)
+            scratch_buffer.SetCapacity(data_size);
+        scratch_buffer.SetSize(data_size);
 
-        buffers->m_VertexBuffer = dmGraphics::NewVertexBuffer(context, num_vertices * sizeof(dmRig::RigModelVertex), scratch_buffer.Begin(), dmGraphics::BUFFER_USAGE_STATIC_DRAW);
+        CreateVertexData(ddf_mesh, scratch_buffer.Begin(), format);
+
+        buffers->m_VertexBuffer = dmGraphics::NewVertexBuffer(context, data_size, scratch_buffer.Begin(), dmGraphics::BUFFER_USAGE_STATIC_DRAW);
         buffers->m_VertexCount = num_vertices;
+        buffers->m_RigModelVertexFormat = format;
 
         buffers->m_IndexBuffer = 0;
         buffers->m_IndexCount = 0;
@@ -208,7 +247,9 @@ namespace dmGameSystem
 
     static void CreateBuffers(dmGraphics::HContext context, ModelResource* resource)
     {
-        dmArray<dmRig::RigModelVertex> scratch_buffer;
+        // dmArray<dmRig::RigModelVertex> scratch_buffer;
+        dmArray<uint8_t> scratch_buffer;
+
         for (uint32_t i = 0; i < resource->m_Meshes.Size(); ++i)
         {
             MeshInfo& info = resource->m_Meshes[i];

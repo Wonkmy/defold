@@ -60,6 +60,7 @@ namespace dmGameSystem
     using namespace dmGameSystemDDF;
 
     static const uint16_t ATTRIBUTE_RENDER_DATA_INDEX_UNUSED = 0xffff;
+    static const uint16_t BIND_POSE_INDEX_UNUSED             = 0xffff;
 
     struct ModelInstanceData
     {
@@ -87,10 +88,11 @@ namespace dmGameSystem
         uint32_t                    m_InstanceRenderHash;
         uint32_t                    m_BoneIndex;
         uint32_t                    m_MaterialIndex;
-        uint32_t                    m_Enabled : 1;
-        uint32_t                    m_AttributeRenderDataIndex : 16;
+
+        uint32_t                    m_Enabled                     : 1;
         uint32_t                    m_PerInstanceCustomAttributes : 1;
-        uint32_t                    : 14;
+        uint32_t                    m_AttributeRenderDataIndex    : 16;
+        uint32_t                                                  : 14;
     };
 
     struct ModelComponent
@@ -111,6 +113,7 @@ namespace dmGameSystem
         dmArray<MeshRenderItem>          m_RenderItems;
         dmArray<MeshAttributeRenderData> m_MeshAttributeRenderDatas;
         uint16_t                         m_ComponentIndex;
+        uint16_t                         m_BindPoseCacheAnimationIndex;
         uint8_t                          m_Enabled : 1;
         uint8_t                          m_DoRender : 1;
         uint8_t                          m_AddedToUpdate : 1;
@@ -123,6 +126,7 @@ namespace dmGameSystem
         dmObjectPool<ModelComponent*>    m_Components;
         dmArray<dmRender::RenderObject>  m_RenderObjects;
         dmGraphics::HVertexDeclaration   m_VertexDeclaration;
+        dmGraphics::HVertexDeclaration   m_VertexDeclarationSkinned;
         dmGraphics::HVertexDeclaration   m_InstanceVertexDeclaration;
         dmArray<uint8_t>                 m_InstanceBufferDataLocalSpace;
         dmRender::HBufferedRenderBuffer  m_InstanceBufferLocalSpace;
@@ -130,6 +134,10 @@ namespace dmGameSystem
         dmArray<uint8_t>*                m_VertexBufferData;
         uint32_t*                        m_VertexBufferVertexCounts;
         uint32_t*                        m_VertexBufferDispatchCounts;
+
+        dmGraphics::HTexture             m_BindPoseTexture;
+        HComponentRenderConstants        m_AnimationRenderConstants;
+
         // Temporary scratch array for instances, only used during the creation phase of components
         dmArray<dmGameObject::HInstance> m_ScratchInstances;
         dmRig::HRigContext               m_RigContext;
@@ -153,12 +161,16 @@ namespace dmGameSystem
     dmGameObject::CreateResult CompModelNewWorld(const dmGameObject::ComponentNewWorldParams& params)
     {
         ModelContext* context = (ModelContext*)params.m_Context;
+
         dmRender::HRenderContext render_context = context->m_RenderContext;
+        dmGraphics::HContext graphics_context   = dmRender::GetGraphicsContext(render_context);
+
         ModelWorld* world = new ModelWorld();
         uint32_t comp_count = dmMath::Min(params.m_MaxComponentInstances, context->m_MaxModelCount);
 
         dmRig::NewContextParams rig_params = {0};
-        rig_params.m_MaxRigInstanceCount = comp_count;
+        rig_params.m_MaxRigInstanceCount   = comp_count;
+
         dmRig::Result rr = dmRig::NewContext(rig_params, &world->m_RigContext);
         if (rr != dmRig::RESULT_OK)
         {
@@ -166,12 +178,14 @@ namespace dmGameSystem
             return dmGameObject::CREATE_RESULT_UNKNOWN_ERROR;
         }
 
+        dmGraphics::TextureCreationParams tp;
+        world->m_BindPoseTexture = dmGraphics::NewTexture(graphics_context, tp);
+
         world->m_Components.SetCapacity(comp_count);
         world->m_RenderObjects.SetCapacity(comp_count);
         // position, normal, tangent, color, texcoord0, texcoord1 * sizeof(float)
         DM_STATIC_ASSERT( sizeof(dmRig::RigModelVertex) == ((3+3+4+4+2+2)*4), Invalid_Struct_Size);
 
-        dmGraphics::HContext graphics_context = dmRender::GetGraphicsContext(render_context);
         dmGraphics::HVertexStreamDeclaration stream_declaration_vertex = dmGraphics::NewVertexStreamDeclaration(graphics_context);
         dmGraphics::AddVertexStream(stream_declaration_vertex, "position",  3, dmGraphics::TYPE_FLOAT, false);
         dmGraphics::AddVertexStream(stream_declaration_vertex, "normal",    3, dmGraphics::TYPE_FLOAT, false);
@@ -179,21 +193,25 @@ namespace dmGameSystem
         dmGraphics::AddVertexStream(stream_declaration_vertex, "color",     4, dmGraphics::TYPE_FLOAT, false);
         dmGraphics::AddVertexStream(stream_declaration_vertex, "texcoord0", 2, dmGraphics::TYPE_FLOAT, false);
         dmGraphics::AddVertexStream(stream_declaration_vertex, "texcoord1", 2, dmGraphics::TYPE_FLOAT, false);
+        world->m_VertexDeclaration = dmGraphics::NewVertexDeclaration(graphics_context, stream_declaration_vertex);
+
+        dmGraphics::AddVertexStream(stream_declaration_vertex, "bone_weights", 4, dmGraphics::TYPE_FLOAT, false);
+        dmGraphics::AddVertexStream(stream_declaration_vertex, "bone_indices", 4, dmGraphics::TYPE_FLOAT, false);
+        world->m_VertexDeclarationSkinned = dmGraphics::NewVertexDeclaration(graphics_context, stream_declaration_vertex);
 
         dmGraphics::HVertexStreamDeclaration stream_declaration_instance = dmGraphics::NewVertexStreamDeclaration(graphics_context, dmGraphics::VERTEX_STEP_FUNCTION_INSTANCE);
         dmGraphics::AddVertexStream(stream_declaration_instance, "mtx_world",  16, dmGraphics::TYPE_FLOAT, false);
         dmGraphics::AddVertexStream(stream_declaration_instance, "mtx_normal", 16, dmGraphics::TYPE_FLOAT, false);
-
-        world->m_MaxBatchIndex = 0;
-        world->m_VertexDeclaration         = dmGraphics::NewVertexDeclaration(graphics_context, stream_declaration_vertex);
         world->m_InstanceVertexDeclaration = dmGraphics::NewVertexDeclaration(graphics_context, stream_declaration_instance);
-        world->m_MaxElementsVertices       = dmGraphics::GetMaxElementsVertices(graphics_context);
-        world->m_InstanceBufferLocalSpace  = dmRender::NewBufferedRenderBuffer(context->m_RenderContext, dmRender::RENDER_BUFFER_TYPE_VERTEX_BUFFER);
 
-        world->m_VertexBuffers = new dmRender::HBufferedRenderBuffer[VERTEX_BUFFER_MAX_BATCHES];
-        world->m_VertexBufferData = new dmArray<uint8_t>[VERTEX_BUFFER_MAX_BATCHES];
-        world->m_VertexBufferVertexCounts = new uint32_t[VERTEX_BUFFER_MAX_BATCHES];
+        world->m_MaxElementsVertices        = dmGraphics::GetMaxElementsVertices(graphics_context);
+        world->m_InstanceBufferLocalSpace   = dmRender::NewBufferedRenderBuffer(context->m_RenderContext, dmRender::RENDER_BUFFER_TYPE_VERTEX_BUFFER);
+        world->m_MaxBatchIndex              = 0;
+        world->m_VertexBuffers              = new dmRender::HBufferedRenderBuffer[VERTEX_BUFFER_MAX_BATCHES];
+        world->m_VertexBufferData           = new dmArray<uint8_t>[VERTEX_BUFFER_MAX_BATCHES];
+        world->m_VertexBufferVertexCounts   = new uint32_t[VERTEX_BUFFER_MAX_BATCHES];
         world->m_VertexBufferDispatchCounts = new uint32_t[VERTEX_BUFFER_MAX_BATCHES];
+        world->m_AnimationRenderConstants   = dmGameSystem::CreateRenderConstants();
 
         for(uint32_t i = 0; i < VERTEX_BUFFER_MAX_BATCHES; ++i)
         {
@@ -216,6 +234,8 @@ namespace dmGameSystem
         ModelContext* context = (ModelContext*)params.m_Context;
         ModelWorld* world = (ModelWorld*)params.m_World;
         dmGraphics::DeleteVertexDeclaration(world->m_VertexDeclaration);
+        dmGraphics::DeleteVertexDeclaration(world->m_VertexDeclarationSkinned);
+
         for(uint32_t i = 0; i < VERTEX_BUFFER_MAX_BATCHES; ++i)
         {
             dmRender::DeleteBufferedRenderBuffer(context->m_RenderContext, world->m_VertexBuffers[i]);
@@ -331,6 +351,9 @@ namespace dmGameSystem
                     return name_hash == dmRender::VERTEX_STREAM_TEXCOORD0 || name_hash == dmRender::VERTEX_STREAM_TEXCOORD1;
                 default:break;
             }
+
+            return name_hash == dmRender::VERTEX_STREAM_BONE_WEIGHTS ||
+                   name_hash == dmRender::VERTEX_STREAM_BONE_INDICES;
         }
         else if (step_function == dmGraphics::VERTEX_STEP_FUNCTION_INSTANCE)
         {
@@ -395,9 +418,11 @@ namespace dmGameSystem
         return texture_res;
     }
 
-    static void FillTextures(dmRender::RenderObject* ro, const ModelComponent* component, uint32_t material_index)
+    static uint32_t FillTextures(dmRender::RenderObject* ro, const ModelComponent* component, uint32_t material_index)
     {
         MaterialResource* material = GetMaterialResource(component, component->m_Resource, material_index);
+        uint32_t first_free_index = 0;
+        bool first_free_index_set = false;
         for(uint32_t i = 0; i < material->m_NumTextures; ++i)
         {
             TextureResource* texture_res = component->m_Textures[i];
@@ -407,7 +432,14 @@ namespace dmGameSystem
             }
 
             ro->m_Textures[i] = texture_res ? texture_res->m_Texture : 0;
+
+            if (ro->m_Textures[i] == 0 && !first_free_index_set)
+            {
+                first_free_index_set = true;
+                first_free_index = i;
+            }
         }
+        return first_free_index;
     }
     static void HashMaterial(HashState32* state, const dmGameSystem::MaterialResource* material)
     {
@@ -977,6 +1009,16 @@ namespace dmGameSystem
             world->m_InstanceBufferDataLocalSpace.OffsetCapacity(required_instance_buffer_memory - world->m_InstanceBufferDataLocalSpace.Remaining());
         }
 
+        dmGraphics::HVertexDeclaration vx_decl_base = 0;
+        if (render_item->m_Buffers->m_RigModelVertexFormat == RIG_MODEL_VERTEX_FORMAT_STATIC)
+        {
+            vx_decl_base = world->m_VertexDeclaration;
+        }
+        else if (render_item->m_Buffers->m_RigModelVertexFormat == RIG_MODEL_VERTEX_FORMAT_SKINNED)
+        {
+            vx_decl_base = world->m_VertexDeclarationSkinned;
+        }
+
         uint8_t* instance_write_ptr = world->m_InstanceBufferDataLocalSpace.End();
 
         world->m_RenderObjects.SetSize(world->m_RenderObjects.Size()+1);
@@ -990,7 +1032,7 @@ namespace dmGameSystem
         ro.m_IndexBuffer                                  = render_item->m_Buffers->m_IndexBuffer;              // May be 0
         ro.m_IndexType                                    = render_item->m_Buffers->m_IndexBufferElementType;
         ro.m_InstanceCount                                = instance_count;
-        ro.m_VertexDeclarations[VX_DECL_BASE_BUFFER]      = world->m_VertexDeclaration;
+        ro.m_VertexDeclarations[VX_DECL_BASE_BUFFER]      = vx_decl_base;
         ro.m_VertexBuffers[VX_DECL_BASE_BUFFER]           = render_item->m_Buffers->m_VertexBuffer;
         ro.m_WorldTransform                               = render_item->m_World;
         ro.m_VertexDeclarations[VX_DECL_INSTANCE_BUFFER]  = world->m_InstanceVertexDeclaration;
@@ -1083,6 +1125,11 @@ namespace dmGameSystem
         world->m_InstanceBufferDataLocalSpace.SetSize(instance_write_ptr - world->m_InstanceBufferDataLocalSpace.Begin());
     }
 
+    static inline dmGraphics::HVertexDeclaration GetBaseVertexDeclaration(ModelWorld* world, dmRender::HMaterial material)
+    {
+        return dmRender::GetMaterialHasSkinnedAttributes(material) ? world->m_VertexDeclarationSkinned : world->m_VertexDeclaration;
+    }
+
     static void RenderBatchLocalVSUninstanced(ModelWorld* world, dmRender::HRenderContext render_context,
         dmRender::HMaterial render_context_material, uint32_t material_index,
         ModelComponent* component, dmRender::RenderListEntry *buf, uint32_t* begin, uint32_t* end)
@@ -1095,24 +1142,28 @@ namespace dmGameSystem
 
         for (uint32_t *i=begin;i!=end;i++)
         {
-            MeshRenderItem* render_item           = (MeshRenderItem*) buf[*i].m_UserData;
-            component                             = render_item->m_Component;
-            material_index                        = render_item->m_MaterialIndex;
-            dmRender::HMaterial render_material   = GetRenderMaterial(render_context_material, component, component->m_Resource, material_index);
-            ModelResourceBuffers* buffers         = render_item->m_Buffers;
-            MeshAttributeRenderData* attribute_rd = 0;
+            MeshRenderItem* render_item            = (MeshRenderItem*) buf[*i].m_UserData;
+            component                              = render_item->m_Component;
+            material_index                         = render_item->m_MaterialIndex;
+            dmRender::HMaterial render_material    = GetRenderMaterial(render_context_material, component, component->m_Resource, material_index);
+            dmRender::HMaterial component_material = GetComponentMaterial(component, component->m_Resource, material_index);
+            ModelResourceBuffers* buffers          = render_item->m_Buffers;
+            MeshAttributeRenderData* attribute_rd  = 0;
+
+            dmGraphics::HVertexDeclaration vx_decl_base = GetBaseVertexDeclaration(world, component_material);
 
             world->m_RenderObjects.SetSize(world->m_RenderObjects.Size()+1);
             dmRender::RenderObject& ro = world->m_RenderObjects.Back();
             ro.Init();
-            ro.m_Material              = GetComponentMaterial(component, component->m_Resource, material_index);
+            ro.m_Material              = component_material;
             ro.m_PrimitiveType         = dmGraphics::PRIMITIVE_TRIANGLES;
             ro.m_VertexStart           = 0;
             ro.m_VertexCount           = buffers->m_IndexCount;
             ro.m_IndexBuffer           = buffers->m_IndexBuffer;              // May be 0
             ro.m_IndexType             = buffers->m_IndexBufferElementType;
-            ro.m_VertexDeclarations[0] = world->m_VertexDeclaration;
+            ro.m_VertexDeclarations[0] = vx_decl_base;
             ro.m_VertexBuffers[0]      = buffers->m_VertexBuffer;
+            ro.m_WorldTransform        = render_item->m_World;
 
             if (render_context_material_custom_attributes || render_item->m_AttributeRenderDataIndex != ATTRIBUTE_RENDER_DATA_INDEX_UNUSED)
             {
@@ -1145,13 +1196,35 @@ namespace dmGameSystem
                 }
             }
 
-            ro.m_WorldTransform = render_item->m_World;
+            uint32_t first_free_index = FillTextures(&ro, component, material_index);
 
-            FillTextures(&ro, component, material_index);
+            HComponentRenderConstants constants = component->m_RenderConstants;
 
-            if (component->m_RenderConstants)
+            if (component->m_RigInstance && render_item->m_Buffers->m_RigModelVertexFormat == RIG_MODEL_VERTEX_FORMAT_SKINNED)
             {
-                dmGameSystem::EnableRenderObjectConstants(&ro, component->m_RenderConstants);
+                const dmhash_t DM_POSE_MATRIX_CACHE_HASH = dmHashString64("dm_pose_matrix_cache");
+                const dmhash_t DM_ANIMATION_DATA_HASH = dmHashString64("dm_animation_data");
+
+                dmRender::SetMaterialSampler(ro.m_Material, DM_POSE_MATRIX_CACHE_HASH, first_free_index,
+                    dmGraphics::TEXTURE_WRAP_CLAMP_TO_EDGE, dmGraphics::TEXTURE_WRAP_CLAMP_TO_EDGE,
+                    dmGraphics::TEXTURE_FILTER_NEAREST, dmGraphics::TEXTURE_FILTER_NEAREST, 0.0f);
+
+                ro.m_Textures[first_free_index] = world->m_BindPoseTexture;
+
+                constants = constants ? constants : world->m_AnimationRenderConstants;
+
+                dmVMath::Vector4 animation_data;
+                animation_data.setX((float) component->m_BindPoseCacheAnimationIndex); // Animation start
+                animation_data.setY(0.0); // Bone count (TODO)
+                animation_data.setZ(dmGraphics::GetTextureWidth(world->m_BindPoseTexture)); // Inv cache W
+                animation_data.setW(dmGraphics::GetTextureHeight(world->m_BindPoseTexture)); // Inv cache H
+
+                SetRenderConstant(constants, DM_ANIMATION_DATA_HASH, &animation_data, 1);
+            }
+
+            if (constants)
+            {
+                dmGameSystem::EnableRenderObjectConstants(&ro, constants);
             }
             dmRender::AddToRender(render_context, &ro);
         }
@@ -1421,6 +1494,49 @@ namespace dmGameSystem
         }
     }
 
+    static void FlushPoseMatrixCache(ModelWorld* world)
+    {
+        dmRig::PoseMatrixCache* pose_matrix_cache = dmRig::GetPoseMatrixCache(world->m_RigContext);
+
+        // 4 vec4s per matrices
+        // uint32_t num_floats    = pose_matrix_cache->m_PoseMatrices.Size() * 4;
+        // 
+        // uint32_t matrix_size = 16 * sizeof(float);
+
+        uint32_t num_animations = pose_matrix_cache->m_BoneCounts.Size();
+
+        void* texture_memory = malloc(num_animations * pose_matrix_cache->m_MaxBoneCount * sizeof(dmVMath::Matrix4));
+        uint8_t* texture_memory_write_ptr = (uint8_t*) texture_memory;
+
+        dmVMath::Matrix4* animation_data_begin = pose_matrix_cache->m_PoseMatrices.Begin();
+        for (int i = 0; i < num_animations; ++i)
+        {
+            memcpy(texture_memory_write_ptr, animation_data_begin, pose_matrix_cache->m_BoneCounts[i] * sizeof(dmVMath::Matrix4));
+            texture_memory_write_ptr += pose_matrix_cache->m_MaxBoneCount * sizeof(dmVMath::Matrix4);
+            animation_data_begin     += pose_matrix_cache->m_BoneCounts[i];
+        }
+
+        /*
+        uint32_t texture_width = (uint32_t) ceil(sqrt(num_floats));
+        uint8_t mipmap        = dmGraphics::GetMipmapCount(texture_width);
+        uint32_t texture_size = (uint32_t) pow(2, mipmap);
+        */
+
+        dmGraphics::TextureParams tp;
+        tp.m_Width     = pose_matrix_cache->m_MaxBoneCount * 4;
+        tp.m_Height    = num_animations;
+        tp.m_Depth     = 1;
+        tp.m_Format    = dmGraphics::TEXTURE_FORMAT_RGBA32F;
+        tp.m_Data      = pose_matrix_cache->m_PoseMatrices.Begin();
+        tp.m_MinFilter = dmGraphics::TEXTURE_FILTER_NEAREST;
+        tp.m_MagFilter = dmGraphics::TEXTURE_FILTER_NEAREST;
+        dmGraphics::SetTexture(world->m_BindPoseTexture, tp);
+
+        dmRig::ResetPoseMatrixCache(world->m_RigContext);
+
+        free(texture_memory);
+    }
+
     // TODO: What are the dependencies here?
     // Why can we not call this in the CompModelUpdate() function?
 
@@ -1460,6 +1576,24 @@ namespace dmGameSystem
             world->m_RenderObjects.SetCapacity(num_render_items);
     }
 
+    static bool RequiresBindPoseCaching(const ModelComponent& component)
+    {
+        if (!component.m_RigInstance)
+            return false;
+        uint32_t render_item_count = component.m_RenderItems.Size();
+        for (uint32_t j = 0; j < render_item_count; ++j)
+        {
+            const MeshRenderItem& render_item = component.m_RenderItems[j];
+            if (!render_item.m_Enabled)
+                continue;
+            if (render_item.m_Buffers->m_RigModelVertexFormat == RIG_MODEL_VERTEX_FORMAT_SKINNED)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     dmGameObject::CreateResult CompModelAddToUpdate(const dmGameObject::ComponentAddToUpdateParams& params)
     {
         ModelWorld* world = (ModelWorld*)params.m_World;
@@ -1473,8 +1607,6 @@ namespace dmGameSystem
     {
         ModelWorld* world = (ModelWorld*)params.m_World;
         ModelContext* context = (ModelContext*)params.m_Context;
-
-        dmRig::Result rig_res = dmRig::Update(world->m_RigContext, params.m_UpdateContext->m_DT);
 
         const dmArray<ModelComponent*>& components = world->m_Components.GetRawObjects();
         const uint32_t count = components.Size();
@@ -1492,10 +1624,19 @@ namespace dmGameSystem
                 ReHash(&component);
             }
 
+            component.m_BindPoseCacheAnimationIndex = BIND_POSE_INDEX_UNUSED;
+            if (RequiresBindPoseCaching(component))
+            {
+                // TODO: Error handling
+                component.m_BindPoseCacheAnimationIndex = dmRig::AcquirePoseMatrixCacheIndex(world->m_RigContext, component.m_RigInstance);
+            }
+
             component.m_DoRender = 1;
 
             DM_PROPERTY_ADD_U32(rmtp_Model, 1);
         }
+
+        dmRig::Result rig_res = dmRig::Update(world->m_RigContext, params.m_UpdateContext->m_DT);
 
         assert(world->m_MaxBatchIndex < VERTEX_BUFFER_MAX_BATCHES);
         for (int i = 0; i <= world->m_MaxBatchIndex; ++i)
@@ -1558,6 +1699,8 @@ namespace dmGameSystem
                 {
                     dmRender::SetBufferData(params.m_Context, world->m_InstanceBufferLocalSpace, world->m_InstanceBufferDataLocalSpace.Size(), world->m_InstanceBufferDataLocalSpace.Begin(), dmGraphics::BUFFER_USAGE_DYNAMIC_DRAW);
                 }
+
+                FlushPoseMatrixCache(world);
 
                 uint32_t total_count = 0;
                 for (uint32_t batch_index = 0; batch_index < VERTEX_BUFFER_MAX_BATCHES; ++batch_index)

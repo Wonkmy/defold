@@ -136,16 +136,16 @@ namespace dmRender
 
         uint32_t num_material_attributes = m->m_MaterialAttributes.Size();
         bool use_secondary_vertex_declarations = false;
+        bool has_skin_attributes = false;
 
-        // 1. Find out if we need to use secondary vertex and instance declarations
+        // 1. Query attributes for speicfic conditions:
+        //    * do we need to use secondary vertex and instance declarations
+        //    * are any of the attributes "skinned" attributes
         for (int i = 0; i < num_material_attributes; ++i)
         {
             const dmGraphics::VertexAttribute& graphics_attribute = m->m_VertexAttributes[i];
-            if (graphics_attribute.m_StepFunction == dmGraphics::VERTEX_STEP_FUNCTION_INSTANCE)
-            {
-                use_secondary_vertex_declarations = true;
-                break;
-            }
+            use_secondary_vertex_declarations |= graphics_attribute.m_StepFunction == dmGraphics::VERTEX_STEP_FUNCTION_INSTANCE;
+            has_skin_attributes               |= graphics_attribute.m_NameHash == VERTEX_STREAM_BONE_WEIGHTS || graphics_attribute.m_NameHash == VERTEX_STREAM_BONE_INDICES;
         }
 
         dmGraphics::HVertexStreamDeclaration sd_shared   = dmGraphics::NewVertexStreamDeclaration(graphics_context);
@@ -180,6 +180,7 @@ namespace dmRender
             #undef ADD_VERTEX_STREAM
         }
 
+        m->m_HasSkinnedAttributes = has_skin_attributes;
         m->m_VertexDeclarationShared = dmGraphics::NewVertexDeclaration(graphics_context, sd_shared);
         dmGraphics::DeleteVertexStreamDeclaration(sd_shared);
 
@@ -560,6 +561,11 @@ namespace dmRender
         }
 
         CreateVertexDeclarations(GetGraphicsContext(material->m_RenderContext), material);
+    }
+
+    bool GetMaterialHasSkinnedAttributes(HMaterial material)
+    {
+        return material->m_HasSkinnedAttributes;
     }
 
     void SetMaterialProgramConstant(HMaterial material, dmhash_t name_hash, Vector4* values, uint32_t count)
