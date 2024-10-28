@@ -62,6 +62,7 @@ import java.util.zip.ZipFile;
 import java.util.zip.ZipOutputStream;
 
 import com.defold.extension.pipeline.ILuaTranspiler;
+import com.dynamo.bob.archive.ArchiveBuilder;
 import com.dynamo.bob.fs.ClassLoaderMountPoint;
 import com.dynamo.bob.fs.DefaultFileSystem;
 import com.dynamo.bob.fs.DefaultResource;
@@ -1743,7 +1744,7 @@ public class Project {
             allOutputs.addAll(task.getOutputs());
         }
         tasks.clear();
-
+        ArchiveBuilder.maxThreads = getMaxCpuThreads();
         TextureGenerator.maxThreads = getMaxCpuThreads();
 
         // Keep track of the paths for all outputs

@@ -28,11 +28,16 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.Map;
 import java.util.HashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.FilenameUtils;
@@ -49,7 +54,6 @@ import com.dynamo.liveupdate.proto.Manifest.ResourceEntryFlag;
 
 import com.dynamo.bob.archive.publisher.PublisherSettings;
 import com.dynamo.bob.archive.publisher.ZipPublisher;
-import com.dynamo.bob.util.TimeProfiler;
 
 import net.jpountz.lz4.LZ4Compressor;
 import net.jpountz.lz4.LZ4Factory;
@@ -59,7 +63,8 @@ public class ArchiveBuilder {
     public static final int VERSION = 5;
     public static final int HASH_MAX_LENGTH = 64; // 512 bits
     public static final int HASH_LENGTH = 20;
-    public static final int MD5_HASH_DIGEST_BYTE_LENGTH = 16; // 128 bits
+    public static final int MD5_HASH_DIGEST_BYTE_LENGTH = 16;
+    public static int maxThreads = Project.getDefaultMaxCpuThreads();// 128 bits
 
     private List<ArchiveEntry> entries = new ArrayList<ArchiveEntry>();
     private List<ArchiveEntry> excludedEntries = new ArrayList<ArchiveEntry>();
@@ -174,75 +179,84 @@ public class ArchiveBuilder {
 
         Collections.sort(entries); // Since it has no hash, it sorts on path
 
+        ExecutorService executorService = Executors.newFixedThreadPool(maxThreads);
+        List<Future<Void>> futures = new ArrayList<>();
+        List<Integer> indicesToExclude = new ArrayList<>();
         for (int i = entries.size() - 1; i >= 0; --i) {
-            TimeProfiler.start("Write file");
-            ArchiveEntry entry = entries.get(i);
-            TimeProfiler.addData("res", entry.getFilename());
+            final int index = i;
+            futures.add(executorService.submit(() -> {
+                ArchiveEntry entry = entries.get(index);
 
-            byte[] buffer = this.loadResourceData(entry.getFilename());
-
-            int resourceEntryFlags = 0;
-
-            if (entry.isCompressed()) {
-                TimeProfiler.start("Compresss");
-                // Compress data
-                byte[] compressed = this.compressResourceData(buffer);
-                if (this.shouldUseCompressedResourceData(buffer, compressed)) {
-                    // Note, when forced, the compressed size may be larger than the original size (For unit tests)
-                    buffer = compressed;
-                    entry.setCompressedSize(compressed.length);
-                    entry.setFlag(ArchiveEntry.FLAG_COMPRESSED);
-                    resourceEntryFlags |= ResourceEntryFlag.COMPRESSED.getNumber();
-                } else {
-                    entry.setCompressedSize(ArchiveEntry.FLAG_UNCOMPRESSED);
+                byte[] buffer = this.loadResourceData(entry.getFilename());
+                int resourceEntryFlags = 0;
+                // Compression
+                if (entry.isCompressed()) {
+                    byte[] compressed = this.compressResourceData(buffer);
+                    if (this.shouldUseCompressedResourceData(buffer, compressed)) {
+                        buffer = compressed;
+                        entry.setCompressedSize(compressed.length);
+                        entry.setFlag(ArchiveEntry.FLAG_COMPRESSED);
+                        resourceEntryFlags |= ResourceEntryFlag.COMPRESSED.getNumber();
+                    } else {
+                        entry.setCompressedSize(ArchiveEntry.FLAG_UNCOMPRESSED);
+                    }
                 }
-                TimeProfiler.stop();
-            }
+                // Encryption
+                if (entry.isEncrypted()) {
+                    buffer = this.encryptResourceData(buffer);
+                    resourceEntryFlags |= ResourceEntryFlag.ENCRYPTED.getNumber();
+                }
+                // Hex Digest
+                String hexDigest;
+                try {
+                    byte[] hashDigest = ManifestBuilder.CryptographicOperations.hash(buffer, manifestBuilder.getResourceHashAlgorithm());
+                    entry.setHash(new byte[HASH_MAX_LENGTH]);
+                    System.arraycopy(hashDigest, 0, entry.getHash(), 0, hashDigest.length);
+                    hexDigest = ManifestBuilder.CryptographicOperations.hexdigest(hashDigest);
+                } catch (NoSuchAlgorithmException exception) {
+                    throw new IOException("Unable to create a Resource Pack, the hashing algorithm is not supported!");
+                }
+                entry.setHexDigest(hexDigest);
+                synchronized (hexDigestCache) {
+                    hexDigestCache.put(entry.getRelativeFilename(), hexDigest);
+                }
 
-            // we need to do this last or the compression won't work as well
-            if (entry.isEncrypted()) {
-                TimeProfiler.start("Encrypt");
-                buffer = this.encryptResourceData(buffer);
-                resourceEntryFlags |= ResourceEntryFlag.ENCRYPTED.getNumber();
-                TimeProfiler.stop();
-            }
+                String normalisedPath = FilenameUtils.separatorsToUnix(entry.getRelativeFilename());
+                if (excludedResources.contains(normalisedPath)) {
+                    synchronized (excludedEntries) {
+                        this.writeResourcePack(entry, resourcePackDirectory.toString(), buffer);
+                        indicesToExclude.add(index);
+                        excludedEntries.add(entry);
+                    }
+                    resourceEntryFlags |= ResourceEntryFlag.EXCLUDED.getNumber();
+                } else {
+                    synchronized (archiveData) {
+                        alignBuffer(archiveData, this.resourcePadding);
+                        entry.setResourceOffset((int) archiveData.getFilePointer());
+                        archiveData.write(buffer, 0, buffer.length);
+                        resourceEntryFlags |= ResourceEntryFlag.BUNDLED.getNumber();
+                    }
+                }
 
-            // Add entry to manifest
-            String normalisedPath = FilenameUtils.separatorsToUnix(entry.getRelativeFilename());
+                synchronized (manifestBuilder) {
+                    manifestBuilder.addResourceEntry(normalisedPath, buffer, entry.getSize(), entry.getCompressedSize(), resourceEntryFlags);
+                }
+                return null;
+            }));
+        }
 
-            // Calculate hash digest values for resource
-            String hexDigest = null;
+        // Wait for all tasks to complete
+        for (Future<Void> future : futures) {
             try {
-                TimeProfiler.start("Hex");
-                byte[] hashDigest = ManifestBuilder.CryptographicOperations.hash(buffer, manifestBuilder.getResourceHashAlgorithm());
-                entry.setHash(new byte[HASH_MAX_LENGTH]);
-                System.arraycopy(hashDigest, 0, entry.getHash(), 0, hashDigest.length);
-                hexDigest = ManifestBuilder.CryptographicOperations.hexdigest(hashDigest);
-                TimeProfiler.stop();
-            } catch (NoSuchAlgorithmException exception) {
-                throw new IOException("Unable to create a Resource Pack, the hashing algorithm is not supported!");
+                future.get(); // Wait for each task to complete
+            } catch (InterruptedException | ExecutionException e) {
+                e.printStackTrace();
             }
-
-            entry.setHexDigest(hexDigest);
-            hexDigestCache.put(entry.getRelativeFilename(), hexDigest);
-
-            TimeProfiler.start("Write");
-            // Write resource to resource pack or data archive
-            if (excludedResources.contains(normalisedPath)) {
-                this.writeResourcePack(entry, resourcePackDirectory.toString(), buffer);
-                entries.remove(i);
-                excludedEntries.add(entry);
-                resourceEntryFlags |= ResourceEntryFlag.EXCLUDED.getNumber();
-            } else {
-                alignBuffer(archiveData, this.resourcePadding);
-                entry.setResourceOffset((int) archiveData.getFilePointer());
-                archiveData.write(buffer, 0, buffer.length);
-                resourceEntryFlags |= ResourceEntryFlag.BUNDLED.getNumber();
-            }
-            TimeProfiler.stop();
-
-            manifestBuilder.addResourceEntry(normalisedPath, buffer, entry.getSize(), entry.getCompressedSize(), resourceEntryFlags);
-            TimeProfiler.stop();
+        }
+        executorService.shutdown();
+        indicesToExclude.sort(Comparator.reverseOrder());
+        for (int index : indicesToExclude) {
+            entries.remove(index);
         }
 
         Collections.sort(entries); // Since it has a hash, it sorts on hash
