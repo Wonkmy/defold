@@ -243,6 +243,10 @@ public class Project {
         if (maxThreadsOpt == null) {
             return getDefaultMaxCpuThreads();
         }
+        int threads = Integer.parseInt(maxThreadsOpt);
+        if (threads == 0) {
+            return Runtime.getRuntime().availableProcessors();
+        }
         return Integer.parseInt(maxThreadsOpt);
     }
 
