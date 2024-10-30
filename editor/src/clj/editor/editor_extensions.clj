@@ -36,10 +36,12 @@
             [editor.lsp :as lsp]
             [editor.lsp.async :as lsp.async]
             [editor.os :as os]
+            [editor.prefs :as prefs]
             [editor.process :as process]
             [editor.resource :as resource]
             [editor.system :as system]
-            [editor.workspace :as workspace])
+            [editor.workspace :as workspace]
+            [util.coll :as coll])
   (:import [com.dynamo.bob Platform]
            [java.nio.file FileAlreadyExistsException Files NotDirectoryException Path]
            [org.luaj.vm2 LuaError Prototype]))
@@ -354,6 +356,91 @@
       (when (and resource (resource/exists? resource) (resource/openable? resource))
         (open-resource! resource)))))
 
+(defn parse-dot-separated-path [^String s]
+  (let [n (.length s)
+        non-empty! (fn [^String s]
+                     (if (.isEmpty s)
+                       (throw (LuaError. "Path element cannot be empty"))
+                       s))]
+    (loop [acc (transient [])
+           from 0
+           to 0]
+      (if (= n to)
+        (persistent! (conj! acc (keyword (non-empty! (.substring s from to)))))
+        (let [ch (.charAt s to)]
+          (cond
+            (= ch \.)
+            (recur (conj! acc (keyword (non-empty! (.substring s from to)))) (inc to) (inc to))
+
+            (or (Character/isLetterOrDigit ch) (= ch \-) (= ch \_))
+            (recur acc from (inc to))
+
+            :else
+            (throw (LuaError. (str "Invalid identifier character: '" ch "'")))))))))
+
+(defn- make-ext-prefs-get-fn [prefs]
+  (rt/lua-fn ext-prefs-get
+    [{:keys [rt]} lua-path]
+    (let [path (parse-dot-separated-path (rt/->clj rt coerce/string lua-path))]
+      (try
+        (prefs/get prefs path)
+        (catch Exception e
+          (case (::prefs/error (ex-data e))
+            :path (throw (LuaError. (str "No schema defined for prefs path '" (string/join "." path) "'")))
+            (throw e)))))))
+
+(defn- map-keys->set [m]
+  (persistent!
+    (reduce-kv
+      (fn [acc k _]
+        (conj! acc k))
+      (transient #{})
+      m)))
+
+(defn- schema->coercer [schema]
+  (case (:type schema)
+    :any coerce/any
+    :boolean coerce/boolean
+    :string coerce/string
+    :keyword coerce/keyword
+    :integer coerce/integer
+    :number coerce/number
+    :array (coerce/vector-of (schema->coercer (:item schema)))
+    :set (coerce/wrap-transform
+           (coerce/map-of (schema->coercer (:item schema))
+                          (coerce/const true))
+           map-keys->set)
+    :map-of (coerce/map-of (schema->coercer (:key schema))
+                           (schema->coercer (:val schema)))
+    :object (coerce/hash-map :opt (coll/pair-map-by key (comp schema->coercer val) (:properties schema))
+                             :extra-keys false)
+    :enum (apply coerce/enum (:values schema))
+    :tuple (apply coerce/tuple (mapv schema->coercer (:items schema)))))
+
+(defn- make-ext-prefs-set-fn [prefs]
+  (rt/lua-fn ext-prefs-set [{:keys [rt]} lua-path lua-value]
+    (let [path-str (rt/->clj rt coerce/string lua-path)
+          path (parse-dot-separated-path path-str)]
+      (try
+        (let [schema (prefs/schema prefs path)
+              coercer (schema->coercer schema)
+              value (rt/->clj rt coercer lua-value)]
+          (prefs/set! prefs path value))
+        (catch Exception e
+          (let [data (ex-data e)]
+            (case (::prefs/error data)
+              ;; we don't catch :value errors here because coercer already
+              ;; verifies the right data shape and presents Lua-specific error
+              ;; messages to the user
+              :path (throw (LuaError. (str "No schema defined for prefs path '" path-str "'")))
+              (throw e))))))))
+
+;; todo define schemas from editor scripts
+;; todo merge editor script defined schemas, removing conflicting schemas so they
+;;      can't be read or written to. plus warn on reload.
+;; todo check that editor prefs work now that they throw exceptions on invalid keys/vals
+;; todo write tests for prefs: get/set, conflicts, schemas...
+
 ;; endregion
 
 ;; region language servers
@@ -516,6 +603,7 @@
     kind       which scripts to reload, either :all, :library or :project
 
   Required kv-args:
+    :prefs                editor prefs
     :reload-resources!    0-arg function that asynchronously reloads the editor
                           resources, returns a CompletableFuture (that might
                           complete exceptionally if reload fails)
@@ -541,8 +629,8 @@
                                                   strings
                             evaluation-context    evaluation context of the
                                                   invocation"
-  [project kind & {:keys [reload-resources! display-output! save! open-resource! invoke-bob!] :as opts}]
-  {:pre [reload-resources! display-output! save! open-resource! invoke-bob!]}
+  [project kind & {:keys [prefs reload-resources! display-output! save! open-resource! invoke-bob!] :as opts}]
+  {:pre [prefs reload-resources! display-output! save! open-resource! invoke-bob!]}
   (g/with-auto-evaluation-context evaluation-context
     (let [extensions (g/node-value project :editor-extensions evaluation-context)
           old-state (ext-state project evaluation-context)
@@ -565,6 +653,8 @@
                                "execute" (make-ext-execute-fn project-path display-output! reload-resources!)
                                "bob" (make-ext-bob-fn invoke-bob!)
                                "platform" (.getPair (Platform/getHostPlatform))
+                               "prefs" {"get" (make-ext-prefs-get-fn prefs)
+                                        "set" (make-ext-prefs-set-fn prefs)}
                                "save" (make-ext-save-fn save!)
                                "transact" ext-transact
                                "tx" {"set" (make-ext-tx-set-fn project)}

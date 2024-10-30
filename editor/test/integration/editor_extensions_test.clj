@@ -276,6 +276,7 @@
   (test-util/with-loaded-project "test/resources/editor_extensions/commands_project"
     (let [sprite-outline (:node-id (test-util/outline (test-util/resource-node project "/main/main.collection") [0 0]))]
       (extensions/reload! project :all
+                          :prefs (test-util/make-test-prefs)
                           :reload-resources! (make-reload-resources-fn workspace)
                           :display-output! println
                           :save! (make-save-fn project)
@@ -303,6 +304,7 @@
   (test-util/with-loaded-project "test/resources/editor_extensions/refresh_context_project"
     (let [output (atom [])
           _ (extensions/reload! project :all
+                                :prefs (test-util/make-test-prefs)
                                 :reload-resources! (make-reload-resources-fn workspace)
                                 :display-output! #(swap! output conj [%1 %2])
                                 :save! (make-save-fn project)
@@ -328,6 +330,7 @@
   (test-util/with-loaded-project "test/resources/editor_extensions/execute_test"
     (let [output (atom [])
           _ (extensions/reload! project :all
+                                :prefs (test-util/make-test-prefs)
                                 :reload-resources! (make-reload-resources-fn workspace)
                                 :display-output! #(swap! output conj [%1 %2])
                                 :save! (make-save-fn project)
@@ -355,6 +358,7 @@
   (test-util/with-loaded-project "test/resources/editor_extensions/transact_test"
     (let [output (atom [])
           _ (extensions/reload! project :all
+                                :prefs (test-util/make-test-prefs)
                                 :reload-resources! (make-reload-resources-fn workspace)
                                 :display-output! #(swap! output conj [%1 %2])
                                 :save! (make-save-fn project)
@@ -401,6 +405,7 @@
   (test-util/with-loaded-project "test/resources/editor_extensions/save_test"
     (let [output (atom [])
           _ (extensions/reload! project :all
+                                :prefs (test-util/make-test-prefs)
                                 :reload-resources! (make-reload-resources-fn workspace)
                                 :display-output! #(swap! output conj [%1 %2])
                                 :save! (make-save-fn project)
@@ -422,6 +427,7 @@
   (test-util/with-loaded-project "test/resources/editor_extensions/resource_attributes_project"
     (let [output (atom [])
           _ (extensions/reload! project :all
+                                :prefs (test-util/make-test-prefs)
                                 :reload-resources! (make-reload-resources-fn workspace)
                                 :display-output! #(swap! output conj [%1 %2])
                                 :save! (make-save-fn project)
@@ -446,6 +452,7 @@
   (test-util/with-loaded-project "test/resources/editor_extensions/open_resource_project"
     (let [output (atom [])
           _ (extensions/reload! project :all
+                                :prefs (test-util/make-test-prefs)
                                 :reload-resources! (make-reload-resources-fn workspace)
                                 :display-output! #(swap! output conj [%1 %2])
                                 :save! (make-save-fn project)
@@ -587,7 +594,11 @@
       (is (= {:a 1 :b 2} (coerce (coerce/hash-map
                                    :req {:a coerce/integer}
                                    :opt {:b coerce/integer})
-                                 {:a 1 :b 2}))))
+                                 {:a 1 :b 2})))
+      (is (thrown? LuaError (coerce (coerce/hash-map :extra-keys false) {:a 1})))
+      (is (thrown? LuaError (coerce (coerce/hash-map :opt {:b coerce/integer} :extra-keys false) {:a 1})))
+      (is (= {:a 1} (coerce (coerce/hash-map :opt {:a coerce/integer} :extra-keys false) {:a 1})))
+      (is (= {:a 1} (coerce (coerce/hash-map :req {:a coerce/integer} :extra-keys false) {:a 1}))))
 
     (testing "one-of"
       (is (= "foo" (coerce (coerce/one-of coerce/string coerce/integer) "foo")))
@@ -613,6 +624,7 @@
   (test-util/with-loaded-project "test/resources/editor_extensions/external_file_attributes_project"
     (let [output (atom [])
           _ (extensions/reload! project :all
+                                :prefs (test-util/make-test-prefs)
                                 :reload-resources! (make-reload-resources-fn workspace)
                                 :display-output! #(swap! output conj [%1 %2])
                                 :save! (make-save-fn project)
@@ -636,6 +648,7 @@
   (test-util/with-loaded-project "test/resources/editor_extensions/ui_project"
     (let [output (atom [])
           _ (extensions/reload! project :all
+                                :prefs (test-util/make-test-prefs)
                                 :reload-resources! (make-reload-resources-fn workspace)
                                 :display-output! #(swap! output conj [%1 %2])
                                 :save! (make-save-fn project)
@@ -652,3 +665,29 @@
       ;; form a valid UI tree. In case of any errors the output will get error
       ;; entries.
       (is (= [] @output)))))
+
+(deftest prefs-test
+  (testing "dot-separated paths parsing"
+    (are [s path] (= path (extensions/parse-dot-separated-path s))
+      "foo.bar.baz" [:foo :bar :baz]
+      "foo-bar.baz" [:foo-bar :baz]
+      "foo-bar_baz" [:foo-bar_baz]
+      "3d" [:3d])
+    (are [s re] (thrown-with-msg? LuaError (re-pattern re) (extensions/parse-dot-separated-path s))
+      "" "Path element cannot be empty"
+      "." "Path element cannot be empty"
+      "foo." "Path element cannot be empty"
+      ".foo" "Path element cannot be empty"
+      "foo..bar" "Path element cannot be empty"
+      "foo.bar..." "Path element cannot be empty"
+
+      "with space" "Invalid identifier character"
+      "brace{" "Invalid identifier character"
+      "brace[" "Invalid identifier character"
+      ":colon" "Invalid identifier character"
+      "hash#" "Invalid identifier character"
+      "hash#" "Invalid identifier character"
+      "\\backslash" "Invalid identifier character"
+      "/slash" "Invalid identifier character"
+      "^hat" "Invalid identifier character"
+      "%percent" "Invalid identifier character")))

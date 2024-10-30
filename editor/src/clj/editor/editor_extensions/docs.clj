@@ -166,6 +166,27 @@
         {:name "editor.platform"
          :type :variable
          :description "Editor platform id.\n\nA `string`, either:\n- `\"x86_64-win32\"`\n- `\"x86_64-macos\"`\n- `\"arm64-macos\"`\n- `\"x86_64-linux\"`"}
+        {:name "editor.prefs"
+         :type :module
+         :description "Reading and writing preferences"}
+        {:name "editor.prefs.get"
+         :type :function
+         :parameters [{:name "key_path"
+                       :types ["string"]
+                       :doc "dot-separated preference path"}]
+         :returnvalues [{:name "value"
+                         :types ["any"]
+                         :doc "current pref value or default if a schema for the key path exists, nil otherwise"}]
+         :description "Get preference value\n\nThe schema for the preference value should be defined beforehand."}
+        {:name "editor.prefs.set"
+         :type :function
+         :parameters [{:name "key_path"
+                       :types ["string"]
+                       :doc "dot-separated preference path"}
+                      {:name "value"
+                       :types ["any"]
+                       :doc "new pref value to set"}]
+         :description "Set preference value\n\nThe schema for the preference value should be defined beforehand."}
         {:name "editor.save"
          :type :function
          :parameters []

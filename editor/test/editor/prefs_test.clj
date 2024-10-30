@@ -18,6 +18,16 @@
             [editor.fs :as fs]
             [editor.prefs :as prefs]))
 
+(defmethod assert-expr 'thrown-with-data? [msg [_ expected-data-pred & body :as form]]
+  `(try
+     (do ~@body)
+     (do-report {:type :fail :message ~msg :expected '~form :actual nil})
+     (catch Throwable e#
+       (let [actual-data# (ex-data e#)
+             result# (if (~expected-data-pred actual-data#) :pass :fail)]
+         (do-report {:type result# :message ~msg :expected '~form :actual e#})
+         e#))))
+
 (defmacro with-schemas [id->schema & body]
   `(try
      ~@(map (fn [[id schema]]
@@ -28,6 +38,16 @@
        ~@(map (fn [id]
                 `(prefs/unregister-schema! ~id))
               (keys id->schema)))))
+
+(defn- value-error-data? [path]
+  (fn [x]
+    (and (= :value (::prefs/error x))
+         (= path (:path x)))))
+
+(defn- path-error-data? [path]
+  (fn [x]
+    (and (= :path (::prefs/error x))
+         (= path (:path x)))))
 
 (deftest prefs-types-test
   (with-schemas {::types {:type :object
@@ -79,20 +99,25 @@
                       :enum :bar
                       :tuple ["/game.project" :form-view]}}
              (prefs/get p [])))
-      ;; set to invalid values (expect a single correct field — :string)
-      (prefs/set! p [] {:types {:boolean "not-a-boolean"
-                                :string "STILL A STRING"
-                                :keyword "not-a-keyword"
-                                :integer "not-an-int"
-                                :number "NaN"
-                                :array true
-                                :set false
-                                :enum 12
-                                :tuple nil}})
-      ;; only a valid preference is applied
+      ;; set to invalid values
+      (is (thrown-with-data? (value-error-data? [:types :boolean])
+                             (prefs/set! p [] {:types {:boolean "not-a-boolean"}})))
+      (is (thrown-with-data? (value-error-data? [:types :boolean])
+                             (prefs/set! p [:types] {:boolean "not-a-boolean"})))
+      (are [path value] (thrown-with-data? (value-error-data? path) (prefs/set! p path value))
+        [:types :boolean] "not-a-boolean"
+        [:types :string] 12
+        [:types :keyword] "not-a-keyword"
+        [:types :integer] "not-an-int"
+        [:types :number] "NaN"
+        [:types :array] true
+        [:types :set] false
+        [:types :enum] 12
+        [:types :tuple] nil)
+      ;; No invalid changes are recorded
       (is (= {:types {:any 'foo/bar
                       :boolean false
-                      :string "STILL A STRING"
+                      :string "str"
                       :keyword :something
                       :integer 42
                       :number 42
@@ -107,7 +132,7 @@
     (let [p (prefs/make :scopes {:global (fs/create-temp-file! "global" "test.editor_settings")}
                         :schemas [::unregistered-key])]
       (is (= {:name ""} (prefs/get p [])))
-      (is (nil? (prefs/get p [:undefined]))))))
+      (is (thrown-with-data? (path-error-data? [:undefined]) (prefs/get p [:undefined]))))))
 
 (deftest utf8-handling-test
   (with-schemas {::utf8 {:type :string}}
